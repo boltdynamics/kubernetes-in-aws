@@ -217,14 +217,20 @@ Resources:
               command: systemctl start cfn-hup.service
 
         install_docker:
-          packages:
-              snap:
-                  docker: []
-          services:
-              sysvinit:
-                  docker:
-                      enabled: "true"
-                      ensureRunning: "true"
+          commands:
+            get_certificates:
+              command: sudo apt-get install -y apt-transport-https ca-certificates
+            set_gpg_key:
+              command: curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+            add_docker_repo:
+              command: sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu bionic stable"
+            update:
+              command: sudo apt-get update -y
+            install_docker_ce:
+              command: apt install docker-ce -y
+            add_ubuntu_user_to_docker_group:
+              command: sudo usermod -aG docker ubuntu
+
           # commands:
           #     docker_for_ec2_user:
           #         command: usermod -G docker ec2-user
