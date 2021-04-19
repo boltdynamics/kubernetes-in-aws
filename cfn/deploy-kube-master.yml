@@ -12,10 +12,13 @@ Parameters:
   #   Type: String
 
 Resources:
-  PrasAsgSecurityGroup:
+
+######################################################### Kubernetes Master Resources ###################################################################
+
+  PrasKubeMasterFleetSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Security group which used by Pras ASG EC2s.
+      GroupDescription: Security group which used by Pras Kubernetes Master Nodes
       VpcId:
         Fn::ImportValue: pras-vpc-id
       Tags:
@@ -24,7 +27,7 @@ Resources:
         - Key: "purpose"
           Value: "learning"
 
-  InstanceRole:
+  PrasKubeMasterFleetInstanceRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -75,9 +78,9 @@ Resources:
     Properties:
       Path: "/"
       Roles:
-        - !Ref InstanceRole
+        - !Ref PrasKubeMasterFleetInstanceRole
 
-  PrasLearningFleet:
+  PrasKubeMasterFleet:
     Type: AWS::AutoScaling::AutoScalingGroup
     CreationPolicy:
       ResourceSignal:
@@ -90,15 +93,21 @@ Resources:
       VPCZoneIdentifier:
         - Fn::ImportValue: pras-vpc-private-subnet-a-id
         - Fn::ImportValue: pras-vpc-private-subnet-b-id
-      MinSize: 0
-      MaxSize: 2
-      DesiredCapacity: 1
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 2
       MetricsCollection:
         - Granularity: 1Minute
       HealthCheckGracePeriod: 30
-      LaunchTemplate:
-        LaunchTemplateId: !Ref PrasLearningFleetLaunchTemplate
-        Version: !GetAtt PrasLearningFleetLaunchTemplate.LatestVersionNumber
+      MixedInstancesPolicy:
+        InstancesDistribution:
+          OnDemandPercentageAboveBaseCapacity: 50
+          SpotAllocationStrategy: lowest-price
+          SpotMaxPrice: ""
+        LaunchTemplate:
+            LaunchTemplateSpecification:
+              LaunchTemplateId: !Ref PrasKubeMasterFleetLaunchTemplate
+              Version: !GetAtt PrasKubeMasterFleetLaunchTemplate.LatestVersionNumber
       # NotificationConfigurations:
       #   - NotificationTypes:
       #       - autoscaling:EC2_INSTANCE_LAUNCH
@@ -106,17 +115,17 @@ Resources:
       #     TopicARN:
       #       - Fn::ImportValue: !Sub ${SnsStackName}-SnsTopicArn
 
-  PrasLearningFleetLaunchTemplate:
+  PrasKubeMasterFleetLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
-      LaunchTemplateName: pras-asgs-launch-template
+      LaunchTemplateName: pras-kube-master-asg-launch-template
       LaunchTemplateData:
         IamInstanceProfile:
           Arn: !GetAtt InstanceProfile.Arn
         ImageId: ami-080b87fdc6d5ca853
         InstanceType: t2.micro
         SecurityGroupIds:
-          - !Ref PrasAsgSecurityGroup
+          - !Ref PrasKubeMasterFleetSecurityGroup
         TagSpecifications:
           - ResourceType: instance
             Tags:
@@ -159,17 +168,17 @@ Resources:
             echo "${AWS::StackName} is starting..."
             echo "Setting up Kubernetes infra..."
             /usr/local/bin/cfn-init -v --stack ${AWS::StackName} \
-            --resource PrasLearningFleetLaunchTemplate \
+            --resource PrasKubeMasterFleetLaunchTemplate \
             --configsets setup_kubernetes_infrastructure --region ${AWS::Region}
 
             echo "Setting up CFN Hup"
             /usr/local/bin/cfn-init -v --stack ${AWS::StackName} \
-            --resource PrasLearningFleetLaunchTemplate \
+            --resource PrasKubeMasterFleetLaunchTemplate \
             --configsets cfnhup --region ${AWS::Region}
 
             echo "Setting up New Relic"
             /usr/local/bin/cfn-init -v --stack ${AWS::StackName} \
-            --resource PrasLearningFleetLaunchTemplate \
+            --resource PrasKubeMasterFleetLaunchTemplate \
             --configsets configure_newrelic --region ${AWS::Region}
             EOL
 
@@ -178,7 +187,7 @@ Resources:
             cat > /var/log/cfn-signal.sh << EOL
             #!/bin/bash -e
             /usr/local/bin/cfn-signal --exit-code 0 \
-            --stack ${AWS::StackName} --resource PrasLearningFleet \
+            --stack ${AWS::StackName} --resource PrasKubeMasterFleet \
             --region ${AWS::Region} || true
             EOL
 
@@ -187,16 +196,13 @@ Resources:
     Metadata:
       AWS::CloudFormation::Init:
         configSets:
-          # ssm_setup:
-          #   - setup-aws-ssm-agent
           cfnhup:
             - hupsetup
-          # install_docker:
-          #   - install_docker
           configure_newrelic:
             - new_relic
           setup_kubernetes_infrastructure:
             - kubernetes_infra
+            - certificates
 
         kubernetes_infra:
           commands:
@@ -215,6 +221,71 @@ Resources:
                 wget -q https://storage.googleapis.com/kubernetes-release/release/v1.18.6/bin/linux/amd64/kubectl
                 sudo chmod +x kubectl
                 sudo mv kubectl /usr/local/bin/
+
+        certificates:
+          commands:
+            provision_certificate_authority:
+              command: cd /kubernetes && sudo cfssl gencert -initca /kubernetes/ca-csr.json | cfssljson -bare ca
+
+            generate_admin_client_certificate_and_private_key:
+              command: |
+                cd /kubernetes && sudo cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=kubernetes admin-csr.json | cfssljson -bare admin
+
+          # https://github.com/prabhatsharma/kubernetes-the-hard-way-aws/blob/master/docs/04-certificate-authority.md
+          files:
+            /kubernetes/ca-config.json:
+              content: |
+               {
+                  "signing": {
+                    "default": {
+                      "expiry": "8760h"
+                    },
+                    "profiles": {
+                      "kubernetes": {
+                        "usages": ["signing", "key encipherment", "server auth", "client auth"],
+                        "expiry": "8760h"
+                      }
+                    }
+                  }
+                }
+
+            /kubernetes/ca-csr.json:
+              content: |
+                {
+                  "CN": "Kubernetes",
+                  "key": {
+                    "algo": "rsa",
+                    "size": 2048
+                  },
+                  "names": [
+                    {
+                      "C": "US",
+                      "L": "Portland",
+                      "O": "Kubernetes",
+                      "OU": "CA",
+                      "ST": "Oregon"
+                    }
+                  ]
+                }
+
+            /kubernetes/admin-csr.json:
+              content: |
+                {
+                  "CN": "admin",
+                  "key": {
+                    "algo": "rsa",
+                    "size": 2048
+                  },
+                  "names": [
+                    {
+                      "C": "US",
+                      "L": "Portland",
+                      "O": "system:masters",
+                      "OU": "Kubernetes The Hard Way",
+                      "ST": "Oregon"
+                    }
+                  ]
+                }
 
         new_relic:
           files:
@@ -262,8 +333,8 @@ Resources:
               content: !Sub |
                 [cfn-auto-reloader-hook]
                 triggers=post.update
-                path=Resources.PrasLearningFleetLaunchTemplate.Metadata.AWS::CloudFormation::Init
-                action=/usr/local/bin/cfn-init -v --stack ${AWS::StackName} --resource PrasLearningFleetLaunchTemplate --configsets cfnhup,setup_kubernetes_infrastructure,configure_newrelic --region ${AWS::Region}
+                path=Resources.PrasKubeMasterFleetLaunchTemplate.Metadata.AWS::CloudFormation::Init
+                action=/usr/local/bin/cfn-init -v --stack ${AWS::StackName} --resource PrasKubeMasterFleetLaunchTemplate --configsets cfnhup,setup_kubernetes_infrastructure,configure_newrelic --region ${AWS::Region}
                 runas=root
               mode: "000400"
               owner: "root"
@@ -276,14 +347,17 @@ Resources:
             02start_cfn_hup:
               command: systemctl start cfn-hup.service
 
-  StopPrasLearningFleetEvery3Hours:
+  StopPrasKubeMasterFleetEvery3Hours:
     Type: AWS::AutoScaling::ScheduledAction
     Properties:
       AutoScalingGroupName:
-        Ref: PrasLearningFleet
+        Ref: PrasKubeMasterFleet
       MaxSize: 0
       DesiredCapacity: 0
       Recurrence: "0 */3 * * *"
+
+
+######################################################### Kubernetes Worker Node Resources ###################################################################
 
 
 ######################################################### CLOUDWATCH ###################################################################
@@ -389,7 +463,7 @@ Resources:
 
   CloudWatchConfig:
     Type: AWS::SSM::Association
-    DependsOn: PrasLearningFleet
+    DependsOn: PrasKubeMasterFleet
     Properties:
       AssociationName: Configure-CloudWatch
       Name: AWS-RunShellScript
@@ -408,6 +482,6 @@ Resources:
 ######################################################### END CLOUDWATCH ###################################################################
 
 Outputs:
-  PrasAsgSecurityGroupOutput:
+  PrasKubeMasterFleetSecurityGroupOutput:
     Description: Pras Asg Security Group Id
-    Value: !Ref PrasAsgSecurityGroup
+    Value: !Ref PrasKubeMasterFleetSecurityGroup
