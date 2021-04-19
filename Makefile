@@ -45,6 +45,9 @@ deploy-docker-asgs: ## Deploy customer network factory - custom network step fun
 		--stack-name pras-learning-asg \
 		--capabilities CAPABILITY_NAMED_IAM \
 		--no-fail-on-empty-changeset \
+		--parameter-overrides \
+			NewRelicLicenceKey=$(NEW_RELIC_LICENCE_KEY) \
+			SnsStackName=$(SNS_STACK_NAME) \
 		--tags \
 			Name='Created by Pras for learning'
 .PHONY: deploy-docker-asgs

@@ -3,6 +3,14 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: Deploy autoScaling group and resources
 Transform: AWS::Serverless-2016-10-31
 
+Parameters:
+  NewRelicLicenceKey:
+    Description: New Relice Licence Key
+    Type: String
+  # SnsStackName:
+  #   Description: Cloudformation stack name that contains SNS topic information
+  #   Type: String
+
 Resources:
   PrasAsgSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -74,9 +82,11 @@ Resources:
     CreationPolicy:
       ResourceSignal:
         Count: 1
-        Timeout: PT10M
+        Timeout: PT30M
     Properties:
       AutoScalingGroupName: pras-asg
+      ServiceLinkedRoleARN:
+        !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling
       VPCZoneIdentifier:
         - Fn::ImportValue: pras-vpc-private-subnet-a-id
         - Fn::ImportValue: pras-vpc-private-subnet-b-id
@@ -89,6 +99,12 @@ Resources:
       LaunchTemplate:
         LaunchTemplateId: !Ref PrasLearningFleetLaunchTemplate
         Version: !GetAtt PrasLearningFleetLaunchTemplate.LatestVersionNumber
+      # NotificationConfigurations:
+      #   - NotificationTypes:
+      #       - autoscaling:EC2_INSTANCE_LAUNCH
+      #       - autoscaling:EC2_INSTANCE_TERMINATE
+      #     TopicARN:
+      #       - Fn::ImportValue: !Sub ${SnsStackName}-SnsTopicArn
 
   PrasLearningFleetLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
@@ -121,6 +137,7 @@ Resources:
 
             apt-get update -y
             sudo apt-get install python-pip -y
+            sudo apt install docker.io -y
             sudo pip install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
             instance_id=$(curl http://169.254.169.254/latest/meta-data/instance-id)
             ip_address=$(curl http://169.254.169.254/latest/meta-data/local-ipv4)
@@ -140,14 +157,20 @@ Resources:
             cat > /var/log/cfn-init.sh << EOL
             #!/bin/bash -e
             echo "${AWS::StackName} is starting..."
+            echo "Setting up Kubernetes infra..."
             /usr/local/bin/cfn-init -v --stack ${AWS::StackName} \
             --resource PrasLearningFleetLaunchTemplate \
-            --configsets install_docker --region ${AWS::Region}
+            --configsets setup_kubernetes_infrastructure --region ${AWS::Region}
 
             echo "Setting up CFN Hup"
             /usr/local/bin/cfn-init -v --stack ${AWS::StackName} \
             --resource PrasLearningFleetLaunchTemplate \
             --configsets cfnhup --region ${AWS::Region}
+
+            echo "Setting up New Relic"
+            /usr/local/bin/cfn-init -v --stack ${AWS::StackName} \
+            --resource PrasLearningFleetLaunchTemplate \
+            --configsets configure_newrelic --region ${AWS::Region}
             EOL
 
             sh /var/log/cfn-init.sh &>> /var/log/cfn-init.log
@@ -168,8 +191,44 @@ Resources:
           #   - setup-aws-ssm-agent
           cfnhup:
             - hupsetup
-          install_docker:
-            - install_docker
+          # install_docker:
+          #   - install_docker
+          configure_newrelic:
+            - new_relic
+          setup_kubernetes_infrastructure:
+            - kubernetes_infra
+
+        kubernetes_infra:
+          commands:
+            setup_pki_infrastructure:
+              command: |
+                wget -q --show-progress --https-only --timestamping \
+                  https://storage.googleapis.com/kubernetes-the-hard-way/cfssl/1.4.1/linux/cfssl \
+                  https://storage.googleapis.com/kubernetes-the-hard-way/cfssl/1.4.1/linux/cfssljson
+
+                chmod +x cfssl cfssljson
+                sudo mv cfssl /usr/local/bin/
+                sudo mv cfssljson /usr/local/bin/
+
+            install_kubectl:
+              command: |
+                wget -q https://storage.googleapis.com/kubernetes-release/release/v1.18.6/bin/linux/amd64/kubectl
+                sudo chmod +x kubectl
+                sudo mv kubectl /usr/local/bin/
+
+        new_relic:
+          files:
+            /etc/newrelic-infra.yml:
+              content: !Sub |
+                license_key: ${NewRelicLicenceKey}
+
+          commands:
+            enable_new_relic_gpg_key:
+              command: curl -s https://download.newrelic.com/infrastructure_agent/gpg/newrelic-infra.gpg | sudo apt-key add -
+            add_infrastructure_monitoring_agent_repository:
+              command: printf "deb [arch=amd64] https://download.newrelic.com/infrastructure_agent/linux/apt bionic main" | sudo tee -a /etc/apt/sources.list.d/newrelic-infra.list
+            install_new_relic_package:
+              command: sudo apt-get update -y && sudo apt-get install newrelic-infra -y
 
         hupsetup:
           files:
@@ -198,12 +257,13 @@ Resources:
               mode: "000400"
               owner: root
               group: root
+
             /etc/cfn/hooks.d/cfn-auto-reloader.conf:
               content: !Sub |
                 [cfn-auto-reloader-hook]
                 triggers=post.update
                 path=Resources.PrasLearningFleetLaunchTemplate.Metadata.AWS::CloudFormation::Init
-                action=/usr/local/bin/cfn-init -v --stack ${AWS::StackName} --resource PrasLearningFleetLaunchTemplate --configsets install_docker --region ${AWS::Region}
+                action=/usr/local/bin/cfn-init -v --stack ${AWS::StackName} --resource PrasLearningFleetLaunchTemplate --configsets cfnhup,setup_kubernetes_infrastructure,configure_newrelic --region ${AWS::Region}
                 runas=root
               mode: "000400"
               owner: "root"
@@ -216,44 +276,13 @@ Resources:
             02start_cfn_hup:
               command: systemctl start cfn-hup.service
 
-        install_docker:
-          commands:
-            get_certificates:
-              command: sudo apt-get install -y apt-transport-https ca-certificates
-            set_gpg_key:
-              command: curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
-            add_docker_repo:
-              command: sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu bionic stable"
-            update:
-              command: sudo apt-get update -y
-            install_docker_ce:
-              command: apt install docker-ce -y
-            add_ubuntu_user_to_docker_group:
-              command: sudo usermod -aG docker ubuntu
-
-          # commands:
-          #     docker_for_ec2_user:
-          #         command: usermod -G docker ec2-user
-        # setup-aws-ssm-agent:
-        #   files:
-        #     /tmp/amazon-ssm-agent.deb:
-        #       source: !Sub 'https://amazon-ssm-${AWS::Region}.s3.amazonaws.com/latest/debian_amd64/amazon-ssm-agent.deb'
-        #       mode: '000644'
-        #       owner: root
-        #       group: root
-        #   commands:
-        #     00_setup_aws_ssm_agent:
-        #       command: >
-        #         dpkg -i /tmp/amazon-ssm-agent.deb
-        #         systemctl enable amazon-ssm-agent.service
-        #         service amazon-ssm-agent restart
-
   StopPrasLearningFleetEvery3Hours:
     Type: AWS::AutoScaling::ScheduledAction
     Properties:
       AutoScalingGroupName:
         Ref: PrasLearningFleet
       MaxSize: 0
+      DesiredCapacity: 0
       Recurrence: "0 */3 * * *"
 
 
@@ -382,4 +411,3 @@ Outputs:
   PrasAsgSecurityGroupOutput:
     Description: Pras Asg Security Group Id
     Value: !Ref PrasAsgSecurityGroup
-
