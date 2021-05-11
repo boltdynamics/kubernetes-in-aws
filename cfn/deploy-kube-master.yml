@@ -7,15 +7,18 @@ Parameters:
   NewRelicLicenceKey:
     Description: New Relice Licence Key
     Type: String
-  # SnsStackName:
-  #   Description: Cloudformation stack name that contains SNS topic information
-  #   Type: String
+  WorkerNodePrivateIps:
+    Description: Private IP Addresses to use for Kuberenetes Worker Nodes
+    Type: CommaDelimitedList
+  SnsStackName:
+    Description: Cloudformation stack name that contains SNS topic information
+    Type: String
 
 Resources:
 
 ######################################################### Kubernetes Master Resources ###################################################################
 
-  PrasKubeMasterFleetSecurityGroup:
+  PrasKubeFleetSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Security group which used by Pras Kubernetes Master Nodes
@@ -72,10 +75,16 @@ Resources:
                   - s3:GetEncryptionConfiguration
                   - s3:GetBucketLocation
                 Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ec2:ModifyNetworkInterfaceAttribute
+                  - ec2:DescribeNetworkInterfaces
+                Resource: "*"
 
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
+      InstanceProfileName: pras-kube-fleet-instance-profile
       Path: "/"
       Roles:
         - !Ref PrasKubeMasterFleetInstanceRole
@@ -84,15 +93,15 @@ Resources:
     Type: AWS::AutoScaling::AutoScalingGroup
     CreationPolicy:
       ResourceSignal:
-        Count: 1
+        Count: 2
         Timeout: PT30M
     Properties:
-      AutoScalingGroupName: pras-asg
+      AutoScalingGroupName: pras-kube-master-nodes
       ServiceLinkedRoleARN:
         !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling
       VPCZoneIdentifier:
-        - Fn::ImportValue: pras-vpc-private-subnet-a-id
-        - Fn::ImportValue: pras-vpc-private-subnet-b-id
+        - Fn::ImportValue: pras-vpc-public-subnet-a-id
+        - Fn::ImportValue: pras-vpc-public-subnet-b-id
       MinSize: 1
       MaxSize: 3
       DesiredCapacity: 2
@@ -108,12 +117,12 @@ Resources:
             LaunchTemplateSpecification:
               LaunchTemplateId: !Ref PrasKubeMasterFleetLaunchTemplate
               Version: !GetAtt PrasKubeMasterFleetLaunchTemplate.LatestVersionNumber
-      # NotificationConfigurations:
-      #   - NotificationTypes:
-      #       - autoscaling:EC2_INSTANCE_LAUNCH
-      #       - autoscaling:EC2_INSTANCE_TERMINATE
-      #     TopicARN:
-      #       - Fn::ImportValue: !Sub ${SnsStackName}-SnsTopicArn
+      NotificationConfigurations:
+        - NotificationTypes:
+            - autoscaling:EC2_INSTANCE_LAUNCH
+            - autoscaling:EC2_INSTANCE_TERMINATE
+          TopicARN:
+            - Fn::ImportValue: !Sub ${SnsStackName}-SnsTopicArn
 
   PrasKubeMasterFleetLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
@@ -123,14 +132,18 @@ Resources:
         IamInstanceProfile:
           Arn: !GetAtt InstanceProfile.Arn
         ImageId: ami-080b87fdc6d5ca853
-        InstanceType: t2.micro
+        InstanceType: t3.medium
         SecurityGroupIds:
-          - !Ref PrasKubeMasterFleetSecurityGroup
+          - !Ref PrasKubeFleetSecurityGroup
         TagSpecifications:
           - ResourceType: instance
             Tags:
               - Key: created_by
                 Value: pras
+              - Key: Master Node
+                Value: true
+              - Key: Name
+                Value: pras-kube-master-node
         UserData:
           Fn::Base64: !Sub |
             #!/bin/bash -eux
@@ -147,8 +160,21 @@ Resources:
             apt-get update -y
             sudo apt-get install python-pip -y
             sudo apt install docker.io -y
+            sudo apt-get install jq -y
+            apt-get install unzip -y
             sudo pip install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
             instance_id=$(curl http://169.254.169.254/latest/meta-data/instance-id)
+
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip awscliv2.zip
+            sudo ./aws/install
+
+            # Cloudformation Launch Template does not let you disable source destination check
+            # https://stackoverflow.com/questions/64031706/aws-cloudformation-for-a-nat-instance-disable-sourcedestinationcheck-in-a-laun
+            eni=$(aws ec2 --region ${AWS::Region} describe-network-interfaces \
+              | jq -Mr ".NetworkInterfaces[] | select(.Attachment.InstanceId==\"$instance_id\") | .NetworkInterfaceId")
+            aws ec2 modify-network-interface-attribute --region ${AWS::Region} --network-interface-id $eni --no-source-dest-check
+
             ip_address=$(curl http://169.254.169.254/latest/meta-data/local-ipv4)
 
             # Track running processes every minute
@@ -202,7 +228,8 @@ Resources:
             - new_relic
           setup_kubernetes_infrastructure:
             - kubernetes_infra
-            - certificates
+            - generte_client_certs
+            - generate_admin_client_certs
 
         kubernetes_infra:
           commands:
@@ -222,16 +249,10 @@ Resources:
                 sudo chmod +x kubectl
                 sudo mv kubectl /usr/local/bin/
 
-        certificates:
+        generte_client_certs:
           commands:
-            provision_certificate_authority:
-              command: cd /kubernetes && sudo cfssl gencert -initca /kubernetes/ca-csr.json | cfssljson -bare ca
-
-            generate_admin_client_certificate_and_private_key:
-              command: |
-                cd /kubernetes && sudo cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=kubernetes admin-csr.json | cfssljson -bare admin
-
-          # https://github.com/prabhatsharma/kubernetes-the-hard-way-aws/blob/master/docs/04-certificate-authority.md
+            generte_client_certs:
+              command: cd /kubernetes && sudo cfssl gencert -initca ca-csr.json | cfssljson -bare ca
           files:
             /kubernetes/ca-config.json:
               content: |
@@ -268,6 +289,12 @@ Resources:
                   ]
                 }
 
+        generate_admin_client_certs:
+          commands:
+            generate_admin_client_certs:
+              command: cd /kubernetes && sudo cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=kubernetes admin-csr.json | cfssljson -bare admin
+          # https://github.com/prabhatsharma/kubernetes-the-hard-way-aws/blob/master/docs/04-certificate-authority.md
+          files:
             /kubernetes/admin-csr.json:
               content: |
                 {
@@ -291,8 +318,25 @@ Resources:
           files:
             /etc/newrelic-infra.yml:
               content: !Sub |
+                verbose: 1
                 license_key: ${NewRelicLicenceKey}
-
+                display_name: PrasKubeMasterNode
+                log_file: /var/log/newrelic-infra/newrelic-infra.log
+                custom_attributes:
+                  environment: pras-production
+                  service: kubernetes
+                  team: pras-go-team
+                  role: master-node
+                log_format: json
+            /etc/newrelic-infra/logging.d/cfn-init-logs.yml:
+              content: !Sub |
+                logs:
+                  - name: "audit_logs"
+                    file: /var/log/audit/audit.log
+                  - name: "messages"
+                    file: /var/log/messages
+                  - name: "ssm_agent_logs"
+                    file: /var/log/amazon/ssm/amazon-ssm-agent.log
           commands:
             enable_new_relic_gpg_key:
               command: curl -s https://download.newrelic.com/infrastructure_agent/gpg/newrelic-infra.gpg | sudo apt-key add -
@@ -352,6 +396,7 @@ Resources:
     Properties:
       AutoScalingGroupName:
         Ref: PrasKubeMasterFleet
+      MinSize: 0
       MaxSize: 0
       DesiredCapacity: 0
       Recurrence: "0 */3 * * *"
@@ -359,7 +404,61 @@ Resources:
 
 ######################################################### Kubernetes Worker Node Resources ###################################################################
 
+  PrasKubeWorkerNode1:
+    Type: AWS::EC2::Instance
+    DependsOn: InstanceProfile
+    Properties:
+      ImageId: ami-080b87fdc6d5ca853
+      InstanceType: t3.medium
+      SourceDestCheck: false
+      IamInstanceProfile: pras-kube-fleet-instance-profile
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          GroupSet:
+            - Ref: PrasKubeFleetSecurityGroup
+          SubnetId: !ImportValue pras-vpc-private-subnet-b-id
+          PrivateIpAddresses:
+            - Primary: true
+              PrivateIpAddress: !Select [ 0, !Ref WorkerNodePrivateIps ]
+            - Primary: false
+              PrivateIpAddress: 10.0.0.198
+            - Primary: false
+              PrivateIpAddress: 10.0.0.199
+            - Primary: false
+              PrivateIpAddress: 10.0.0.200
+            - Primary: false
+              PrivateIpAddress: 10.0.0.201
+      Tags:
+        - Key: Name
+          Value: pras-kube-worker-node-1
 
+  PrasKubeWorkerNode2:
+    Type: AWS::EC2::Instance
+    DependsOn: InstanceProfile
+    Properties:
+      ImageId: ami-080b87fdc6d5ca853
+      InstanceType: t3.medium
+      SourceDestCheck: false
+      IamInstanceProfile: pras-kube-fleet-instance-profile
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          GroupSet:
+            - Ref: PrasKubeFleetSecurityGroup
+          SubnetId: !ImportValue pras-vpc-private-subnet-a-id
+          PrivateIpAddresses:
+            - Primary: true
+              PrivateIpAddress: !Select [ 1, !Ref WorkerNodePrivateIps ]
+            - Primary: false
+              PrivateIpAddress: 10.0.0.134
+            - Primary: false
+              PrivateIpAddress: 10.0.0.135
+            - Primary: false
+              PrivateIpAddress: 10.0.0.136
+            - Primary: false
+              PrivateIpAddress: 10.0.0.137
+      Tags:
+        - Key: Name
+          Value: pras-kube-worker-node-2
 ######################################################### CLOUDWATCH ###################################################################
 
   CloudWatchConfigParam:
@@ -482,6 +581,6 @@ Resources:
 ######################################################### END CLOUDWATCH ###################################################################
 
 Outputs:
-  PrasKubeMasterFleetSecurityGroupOutput:
+  PrasKubeFleetSecurityGroupOutput:
     Description: Pras Asg Security Group Id
-    Value: !Ref PrasKubeMasterFleetSecurityGroup
+    Value: !Ref PrasKubeFleetSecurityGroup

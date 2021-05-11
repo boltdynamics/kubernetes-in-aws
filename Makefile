@@ -35,19 +35,20 @@ deploy-vpc: ## Deploy customer network factory - custom network step function
 			# pras:githash=$(COMMIT_HASH)
 .PHONY: deploy-vpc
 
-deploy-kube-master: ## Deploy customer network factory - custom network step function
+deploy-kube-master: ## Deploy Kubernetes Resources
 # ifndef GIT_BRANCH
 # 	$(error GIT_BRANCH is undefined, define in parent shell)
 # endif
 	@aws cloudformation deploy \
 		--s3-bucket $(CFN_ARTIFACT_BUCKET_NAME) \
 	    --template-file cfn/deploy-kube-master.yml \
-		--stack-name pras-learning-asg \
+		--stack-name pras-kube-stack \
 		--capabilities CAPABILITY_NAMED_IAM \
 		--no-fail-on-empty-changeset \
 		--parameter-overrides \
 			NewRelicLicenceKey=$(NEW_RELIC_LICENCE_KEY) \
+			WorkerNodePrivateIps=$(WORKER_NODE_PRIVATE_IPS) \
 			SnsStackName=$(SNS_STACK_NAME) \
 		--tags \
-			Name='Kubernetes Master Node - Created by Pras for learning'
+			Name='Kubernetes Resources - Created by Pras for learning'
 .PHONY: deploy-kube-master

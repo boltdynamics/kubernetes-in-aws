@@ -38,14 +38,15 @@ Resources:
     Properties:
       GroupId: !GetAtt Vpc.DefaultSecurityGroup
       IpProtocol: "-1"
-      CidrIp: 127.0.0.1/32
-      Description: CIS 4.4 - Overwrite default SG rules with a rule that effectively removes access
+      CidrIp: 0.0.0.0/0
+      Description: Allow all outbound
 
   PublicSubnetA:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref Vpc
       CidrBlock: !Select [0, !Ref SubnetCidrs]
+      MapPublicIpOnLaunch: true
       AvailabilityZone: !Sub ${AWS::Region}a
       Tags:
         - Key: Name
@@ -55,6 +56,7 @@ Resources:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref Vpc
+      MapPublicIpOnLaunch: true
       CidrBlock: !Select [1, !Ref SubnetCidrs]
       AvailabilityZone: !Sub ${AWS::Region}b
       Tags:
@@ -205,7 +207,7 @@ Resources:
       LogGroupName: !Ref VpcFlowLogGroup
       ResourceId: !Ref Vpc
       ResourceType: VPC
-      LogFormat: ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status} ${vpc-id} ${subnet-id} ${instance-id} ${tcp-flags} ${type} ${pkt-srcaddr} ${pkt-dstaddr}
+      LogFormat: ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${pkt-srcaddr} ${pkt-dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status} ${vpc-id} ${subnet-id} ${instance-id} ${tcp-flags} ${type}
       TrafficType: ALL
 
 Outputs:
